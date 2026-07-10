@@ -1,0 +1,167 @@
+name: 'Google Drive Upload'
+description: '使用 Google 服务账号，通过纯 bash+curl+openssl 直接调用 Drive API v3 上传/覆盖文件，无需现场构建 Docker 镜像'
+author: 'starwaveai-dev'
+branding:
+  icon: 'upload-cloud'
+  color: 'green'
+
+inputs:
+  credentials:
+    description: 'Google 服务账号 JSON 内容（原始 JSON 文本，不需要 base64）'
+    required: true
+  folder_id:
+    description: '目标 Google Drive 文件夹 ID'
+    required: true
+  file_path:
+    description: '要上传的本地文件路径'
+    required: true
+  file_name:
+    description: '上传到 Drive 后的文件名，默认使用 file_path 的文件名'
+    required: false
+    default: ''
+  overwrite:
+    description: '如果文件夹中已存在同名文件，是否覆盖（否则会新建一个同名文件）'
+    required: false
+    default: 'true'
+
+outputs:
+  file_id:
+    description: '上传/更新后的 Google Drive 文件 ID'
+    value: ${{ steps.upload.outputs.file_id }}
+  web_view_link:
+    description: '文件在 Google Drive 中的查看链接'
+    value: ${{ steps.upload.outputs.web_view_link }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 上传文件到 Google Drive
+      id: upload
+      shell: bash
+      env:
+        CREDENTIALS_JSON: ${{ inputs.credentials }}
+        FOLDER_ID: ${{ inputs.folder_id }}
+        FILE_PATH: ${{ inputs.file_path }}
+        FILE_NAME_INPUT: ${{ inputs.file_name }}
+        OVERWRITE: ${{ inputs.overwrite }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "$FILE_PATH" ]; then
+          echo "文件不存在: $FILE_PATH"
+          exit 1
+        fi
+
+        FILE_NAME="$FILE_NAME_INPUT"
+        if [ -z "$FILE_NAME" ]; then
+          FILE_NAME="$(basename "$FILE_PATH")"
+        fi
+
+        KEY_FILE="$(mktemp)"
+        MULTIPART_FILE="$(mktemp)"
+        trap 'rm -f "$KEY_FILE" "$MULTIPART_FILE"' EXIT
+
+        ########################################
+        # base64url 编码
+        ########################################
+        b64url() {
+          base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='
+        }
+
+        ########################################
+        # 从服务账号 JSON 中取出必要字段
+        ########################################
+        CLIENT_EMAIL="$(printf '%s' "$CREDENTIALS_JSON" | jq -r '.client_email')"
+        if [ -z "$CLIENT_EMAIL" ] || [ "$CLIENT_EMAIL" == "null" ]; then
+          echo "无法从 credentials 中解析 client_email，请确认传入的是完整的服务账号 JSON"
+          exit 1
+        fi
+        printf '%s' "$CREDENTIALS_JSON" | jq -r '.private_key' > "$KEY_FILE"
+
+        ########################################
+        # 构造并签名 JWT（RS256）
+        ########################################
+        IAT=$(date +%s)
+        EXP=$((IAT + 3600))
+
+        HEADER='{"alg":"RS256","typ":"JWT"}'
+        CLAIMS=$(jq -cn \
+          --arg iss "$CLIENT_EMAIL" \
+          --argjson iat "$IAT" \
+          --argjson exp "$EXP" \
+          '{iss:$iss, scope:"https://www.googleapis.com/auth/drive", aud:"https://oauth2.googleapis.com/token", iat:$iat, exp:$exp}')
+
+        SIGNING_INPUT="$(printf '%s' "$HEADER" | b64url).$(printf '%s' "$CLAIMS" | b64url)"
+        SIGNATURE="$(printf '%s' "$SIGNING_INPUT" | openssl dgst -sha256 -sign "$KEY_FILE" -binary | b64url)"
+        JWT="${SIGNING_INPUT}.${SIGNATURE}"
+
+        ########################################
+        # 用 JWT 换取 access_token
+        ########################################
+        TOKEN_RESPONSE=$(curl -s -X POST "https://oauth2.googleapis.com/token" \
+          -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+          --data-urlencode "assertion=${JWT}")
+        ACCESS_TOKEN=$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+
+        if [ -z "$ACCESS_TOKEN" ]; then
+          echo "获取 Google access_token 失败:"
+          echo "$TOKEN_RESPONSE"
+          exit 1
+        fi
+
+        ########################################
+        # overwrite=true 时，先查找同名文件
+        ########################################
+        EXISTING_FILE_ID=""
+        if [ "$OVERWRITE" == "true" ]; then
+          FILE_NAME_ESCAPED=$(printf '%s' "$FILE_NAME" | sed "s/'/\\\\'/g")
+          QUERY="name='${FILE_NAME_ESCAPED}' and '${FOLDER_ID}' in parents and trashed=false"
+          SEARCH_RESPONSE=$(curl -s -G "https://www.googleapis.com/drive/v3/files" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            --data-urlencode "q=${QUERY}" \
+            --data-urlencode "fields=files(id,name)")
+          EXISTING_FILE_ID=$(printf '%s' "$SEARCH_RESPONSE" | jq -r '.files[0].id // empty')
+        fi
+
+        ########################################
+        # 构造 multipart/related 请求体
+        ########################################
+        BOUNDARY="gdrive_upload_boundary_$$"
+
+        if [ -n "$EXISTING_FILE_ID" ]; then
+          METADATA='{}'
+          UPLOAD_URL="https://www.googleapis.com/upload/drive/v3/files/${EXISTING_FILE_ID}?uploadType=multipart&fields=id,webViewLink"
+          HTTP_METHOD="PATCH"
+        else
+          METADATA=$(jq -cn --arg name "$FILE_NAME" --arg parent "$FOLDER_ID" '{name:$name, parents:[$parent]}')
+          UPLOAD_URL="https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink"
+          HTTP_METHOD="POST"
+        fi
+
+        {
+          printf -- '--%s\r\n' "$BOUNDARY"
+          printf 'Content-Type: application/json; charset=UTF-8\r\n\r\n'
+          printf '%s\r\n' "$METADATA"
+          printf -- '--%s\r\n' "$BOUNDARY"
+          printf 'Content-Type: application/octet-stream\r\n\r\n'
+          cat "$FILE_PATH"
+          printf '\r\n--%s--\r\n' "$BOUNDARY"
+        } > "$MULTIPART_FILE"
+
+        RESPONSE=$(curl -s -X "$HTTP_METHOD" "$UPLOAD_URL" \
+          -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+          -H "Content-Type: multipart/related; boundary=${BOUNDARY}" \
+          --data-binary "@${MULTIPART_FILE}")
+
+        FILE_ID=$(printf '%s' "$RESPONSE" | jq -r '.id // empty')
+        WEB_VIEW_LINK=$(printf '%s' "$RESPONSE" | jq -r '.webViewLink // empty')
+
+        if [ -z "$FILE_ID" ]; then
+          echo "上传到 Google Drive 失败:"
+          echo "$RESPONSE"
+          exit 1
+        fi
+
+        echo "上传成功，file_id=${FILE_ID}"
+        echo "file_id=${FILE_ID}" >> "$GITHUB_OUTPUT"
+        echo "web_view_link=${WEB_VIEW_LINK}" >> "$GITHUB_OUTPUT"
