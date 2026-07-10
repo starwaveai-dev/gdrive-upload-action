@@ -1,13 +1,19 @@
 name: 'Google Drive Upload'
-description: '使用 Google 服务账号，通过纯 bash+curl+openssl 直接调用 Drive API v3 上传/覆盖文件，无需现场构建 Docker 镜像'
+description: '通过 Google 用户 OAuth 授权（refresh_token），用纯 bash+curl 直接调用 Drive API v3 上传/覆盖文件，无需现场构建 Docker 镜像'
 author: 'starwaveai-dev'
 branding:
   icon: 'upload-cloud'
   color: 'green'
 
 inputs:
-  credentials:
-    description: 'Google 服务账号 JSON 内容（原始 JSON 文本，不需要 base64）'
+  oauth_client_id:
+    description: 'Google OAuth 客户端 ID（Desktop app 类型）'
+    required: true
+  oauth_client_secret:
+    description: 'Google OAuth 客户端密钥'
+    required: true
+  oauth_refresh_token:
+    description: '一次性授权换取的 refresh_token，用于换取 access_token'
     required: true
   folder_id:
     description: '目标 Google Drive 文件夹 ID'
@@ -39,7 +45,9 @@ runs:
       id: upload
       shell: bash
       env:
-        CREDENTIALS_JSON: ${{ inputs.credentials }}
+        OAUTH_CLIENT_ID: ${{ inputs.oauth_client_id }}
+        OAUTH_CLIENT_SECRET: ${{ inputs.oauth_client_secret }}
+        OAUTH_REFRESH_TOKEN: ${{ inputs.oauth_refresh_token }}
         FOLDER_ID: ${{ inputs.folder_id }}
         FILE_PATH: ${{ inputs.file_path }}
         FILE_NAME_INPUT: ${{ inputs.file_name }}
@@ -57,50 +65,17 @@ runs:
           FILE_NAME="$(basename "$FILE_PATH")"
         fi
 
-        KEY_FILE="$(mktemp)"
         MULTIPART_FILE="$(mktemp)"
-        trap 'rm -f "$KEY_FILE" "$MULTIPART_FILE"' EXIT
+        trap 'rm -f "$MULTIPART_FILE"' EXIT
 
         ########################################
-        # base64url 编码
-        ########################################
-        b64url() {
-          base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='
-        }
-
-        ########################################
-        # 从服务账号 JSON 中取出必要字段
-        ########################################
-        CLIENT_EMAIL="$(printf '%s' "$CREDENTIALS_JSON" | jq -r '.client_email')"
-        if [ -z "$CLIENT_EMAIL" ] || [ "$CLIENT_EMAIL" == "null" ]; then
-          echo "无法从 credentials 中解析 client_email，请确认传入的是完整的服务账号 JSON"
-          exit 1
-        fi
-        printf '%s' "$CREDENTIALS_JSON" | jq -r '.private_key' > "$KEY_FILE"
-
-        ########################################
-        # 构造并签名 JWT（RS256）
-        ########################################
-        IAT=$(date +%s)
-        EXP=$((IAT + 3600))
-
-        HEADER='{"alg":"RS256","typ":"JWT"}'
-        CLAIMS=$(jq -cn \
-          --arg iss "$CLIENT_EMAIL" \
-          --argjson iat "$IAT" \
-          --argjson exp "$EXP" \
-          '{iss:$iss, scope:"https://www.googleapis.com/auth/drive", aud:"https://oauth2.googleapis.com/token", iat:$iat, exp:$exp}')
-
-        SIGNING_INPUT="$(printf '%s' "$HEADER" | b64url).$(printf '%s' "$CLAIMS" | b64url)"
-        SIGNATURE="$(printf '%s' "$SIGNING_INPUT" | openssl dgst -sha256 -sign "$KEY_FILE" -binary | b64url)"
-        JWT="${SIGNING_INPUT}.${SIGNATURE}"
-
-        ########################################
-        # 用 JWT 换取 access_token
+        # 用 refresh_token 换取 access_token
         ########################################
         TOKEN_RESPONSE=$(curl -s -X POST "https://oauth2.googleapis.com/token" \
-          -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
-          --data-urlencode "assertion=${JWT}")
+          --data-urlencode "client_id=${OAUTH_CLIENT_ID}" \
+          --data-urlencode "client_secret=${OAUTH_CLIENT_SECRET}" \
+          --data-urlencode "refresh_token=${OAUTH_REFRESH_TOKEN}" \
+          --data-urlencode "grant_type=refresh_token")
         ACCESS_TOKEN=$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
 
         if [ -z "$ACCESS_TOKEN" ]; then
